@@ -352,18 +352,35 @@ func (acct *Accountant) SubmitObservation(msg *common.MessagePublication) (bool,
 	return !enforceFlag, nil
 }
 
-// publishTransferAlreadyLocked publishes a pending transfer to the accountant channel and deletes it from the pending map. It assumes the caller holds the lock.
+// publishTransferAlreadyLocked attempts to send a pending transfer to msgChan and only deletes it on success.
+// If the channel is full, it retries briefly with a blocking send, then keeps the entry pending for audit retry.
 func (acct *Accountant) publishTransferAlreadyLocked(pe *pendingEntry) {
-	if pe.enforceFlag {
-		select {
-		case acct.msgChan <- pe.msg:
-			acct.logger.Debug("published transfer to channel", zap.String("msgId", pe.msgId))
-		default:
-			acct.logger.Error("unable to publish transfer because the channel is full", zap.String("msgId", pe.msgId))
-		}
-	}
-
-	acct.deletePendingTransferAlreadyLocked(pe.msgId)
+    if pe.enforceFlag {
+        // First attempt: non-blocking send
+        select {
+        case acct.msgChan <- pe.msg:
+            acct.logger.Debug("published transfer to channel", zap.String("msgId", pe.msgId))
+            // Success: delete the pending entry
+            acct.deletePendingTransferAlreadyLocked(pe.msgId)
+            return
+        default:
+            acct.logger.Warn("non-blocking send failed, attempting timed retry", zap.String("msgId", pe.msgId))
+            // Second attempt: blocking send with 100ms timeout
+            select {
+            case acct.msgChan <- pe.msg:
+                acct.logger.Debug("published transfer to channel after retry", zap.String("msgId", pe.msgId))
+                // Success: delete the pending entry
+                acct.deletePendingTransferAlreadyLocked(pe.msgId)
+            case <-time.After(100 * time.Millisecond):
+                acct.logger.Error("failed to publish transfer after retry, keeping pending", zap.String("msgId", pe.msgId))
+                // Failure: update timestamp to keep eligible for audit
+                pe.setUpdTime()
+            }
+        }
+    } else {
+        // If enforceFlag is false, delete immediately (existing behavior)
+        acct.deletePendingTransferAlreadyLocked(pe.msgId)
+    }
 }
 
 // addPendingTransferAlreadyLocked adds a pending transfer to both the map and the database. It assumes the caller holds the lock.
